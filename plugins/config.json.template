@@ -1,0 +1,69 @@
+{
+    "godcmd": {
+        "password": "",
+        "admin_users": []
+    },
+    "banwords": {
+        "action": "replace",
+        "reply_filter": true,
+        "reply_action": "ignore"
+    },
+    "tool": {
+        "tools": [
+            "url-get",
+            "meteo-weather"
+        ],
+        "kwargs": {
+            "top_k_results": 2,
+            "no_default": false,
+            "model_name": "gpt-3.5-turbo"
+        }
+    },
+    "linkai": {
+        "group_app_map": {
+            "测试群1": "default",
+            "测试群2": "Kv2fXJcH"
+        },
+        "midjourney": {
+            "enabled": true,
+            "auto_translate": true,
+            "img_proxy": true,
+            "max_tasks": 3,
+            "max_tasks_per_user": 1,
+            "use_image_create_prefix": true
+        },
+        "summary": {
+            "enabled": true,
+            "group_enabled": true,
+            "max_file_size": 5000,
+            "type": ["FILE", "SHARING"]
+        }
+    },
+    "hello": {
+        "group_welc_fixed_msg": {
+            "群聊1": "群聊1的固定欢迎语",
+            "群聊2": "群聊2的固定欢迎语"
+        },
+        "group_welc_prompt": "请你随机使用一种风格说一句问候语来欢迎新用户\"{nickname}\"加入群聊。",
+
+        "group_exit_prompt": "请你随机使用一种风格跟其他群用户说他违反规则\"{nickname}\"退出群聊。",
+
+        "patpat_prompt": "请你随机使用一种风格介绍你自己，并告诉用户输入#help可以查看帮助信息。",
+
+        "use_character_desc": false
+    },
+    "Apilot": {
+        "alapi_token": "xxx",
+        "morning_news_text_enabled": false
+    },
+    "JinaSum": {
+        "jina_reader_base": "https://r.jina.ai",
+        "open_ai_api_base": "https://api.openai.com/v1",
+        "open_ai_api_key":  "sk-xxx",
+        "open_ai_model": "gpt-4o-mini",
+        "max_words": 8000,
+        "white_url_list": [],
+        "black_url_list": ["https://support.weixin.qq.com", "https://channels-aladin.wxqcloud.qq.com"],
+        "prompt": "我需要对下面的文本进行总结，总结输出包括以下三个部分：\n📖 一句话总结\n🔑 关键要点,用数字序号列出3-5个文章的核心内容\n🏷 标签: #xx #xx\n。不要使用'**'加粗标题优化输出格式。"
+    }
+}

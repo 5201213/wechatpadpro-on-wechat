@@ -1,0 +1,70 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+# GitHub recommends pinning actions to a commit SHA.
+# To get a newer version, you will need to update the SHA.
+# You can also reference a tag or branch, but the action may change without warning.
+
+name: Docker Multi-arch Build on Commit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "**.py"
+      - "requirements.txt"
+      - "**.conf"
+      - "**.toml"
+      - "**.yml"
+      - ".github/workflows/deploy-image.yml"
+      - ".dockerignore"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 QEMU 模拟器
+        uses: docker/setup-qemu-action@v2
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+          install: true
+
+      - name: 创建多架构构建器
+        run: |
+          docker buildx create --name multiarch --use
+          docker buildx inspect --bootstrap
+
+      - name: 登录到 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 获取短 SHA
+        id: vars
+        run: echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: 构建并推送多架构镜像
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          builder: multiarch
+          push: true
+          platforms: linux/amd64,linux/arm64
+          file: ./docker/Dockerfile.latest
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/xxx-on-wechat:latest
+          cache-from: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/xxx-on-wechat:latest
+          cache-to: type=inline,mode=max
