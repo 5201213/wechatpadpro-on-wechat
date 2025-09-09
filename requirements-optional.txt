@@ -12,7 +12,7 @@ numpy<=1.24.2
 langid # language detect
 elevenlabs==1.0.3 # elevenlabs TTS
 pilk==0.2.4 # process wechat silk file
-
+pysilk-mod==1.6.4
 #install plugin
 dulwich
 
