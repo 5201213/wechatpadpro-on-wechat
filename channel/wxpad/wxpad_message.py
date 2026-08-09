@@ -23,6 +23,7 @@ class WechatPadProMessage(ChatMessage):
         self.from_user_id = ''
         self.to_user_id = ''
         self.other_user_id = ''
+        self.self_display_name = ''
         self.ctype = ContextType.TEXT
 
         # 适配多种消息格式：WebSocket直接格式、API嵌套格式和转换后格式
@@ -43,20 +44,53 @@ class WechatPadProMessage(ChatMessage):
                 'Content': msg.get('content', {}),  # 保留原始字典结构
                 'CreateTime': msg.get('create_time', 0),
                 'MsgSource': msg.get('msg_source', ''),
-                'ImgBuf': msg.get('img_buf', {})
+                'ImgBuf': msg.get('img_buf', {}),
+                'ReplyContext': msg.get('reply_context', {}),
+                'MessageContext': msg.get('message_context', {}),
+                'App': msg.get('app', {}),
+                'Image': msg.get('image', {}),
+                'Video': msg.get('video', {}),
+                'File': msg.get('file', {}),
+                'Voice': msg.get('voice', {}),
+                'Kind': msg.get('kind', ''),
+                'Direction': msg.get('direction', ''),
+                'MentionedUserIDs': msg.get(
+                    'mentioned_user_ids',
+                    msg.get(
+                        'mentionedUserIDs',
+                        msg.get(
+                            'MentionedUserIDs',
+                            msg.get('message_context', {}).get('mentioned_user_ids', [])
+                            if isinstance(msg.get('message_context'), dict)
+                            else [],
+                        ),
+                    ),
+                ),
+                'AtUserList': msg.get(
+                    'at_user_list',
+                    msg.get('atUserList', msg.get('AtUserList', [])),
+                ),
+                'IsAt': msg.get('is_at', msg.get('is_mentioned', msg.get('IsAt', False))),
+                'RawMessage': msg,
             }
         elif 'FromUserName' in msg and 'ToUserName' in msg and ('MsgId' in msg or 'NewMsgId' in msg):
-            # 已转换的标准格式（通道预处理过的）- 现在Content保留原始字典结构
-            self.msg_data = {
+            # 已转换的标准格式。保留 v2 的媒体下载上下文、引用上下文等
+            # 扩展字段，避免在通道与消息对象的边界再次丢失数据。
+            self.msg_data = dict(msg)
+            from_user = msg.get('FromUserName', '')
+            to_user = msg.get('ToUserName', '')
+            self.msg_data.update({
                 'NewMsgId': msg.get('NewMsgId', msg.get('MsgId', 0)),
-                'FromUserName': {'string': msg.get('FromUserName', '')},
-                'ToUserName': {'string': msg.get('ToUserName', '')},
+                'FromUserName': from_user if isinstance(from_user, dict) else {'string': from_user},
+                'ToUserName': to_user if isinstance(to_user, dict) else {'string': to_user},
                 'MsgType': msg.get('MsgType', 1),
-                'Content': msg.get('Content', {}),  # 保留原始字典结构
+                'Content': msg.get('Content', {}),
                 'CreateTime': msg.get('CreateTime', 0),
                 'MsgSource': msg.get('MsgSource', ''),
-                'ImgBuf': msg.get('ImgBuf', {})
-            }
+                'ImgBuf': msg.get('ImgBuf', {}),
+                'ActualUserName': msg.get('ActualUserName', ''),
+                'IsOutgoing': msg.get('IsOutgoing', False),
+            })
         else:
             logger.warning(f"[wxpad] Unknown message format, missing expected fields")
             logger.debug(f"[wxpad] Available keys: {list(msg.keys())}")
@@ -77,16 +111,28 @@ class WechatPadProMessage(ChatMessage):
         self.is_group = True if "@chatroom" in self.msg_data['FromUserName']['string'] else False
         
         # 更新msg_source属性（覆盖初始化时的默认值）
-        self.msg_source = self.msg_data.get('MsgSource', '')
+        # 兼容新旧API: 新API使用'msg_source', 旧API使用'MsgSource'
+        self.msg_source = self.msg_data.get('msg_source', self.msg_data.get('MsgSource', ''))
 
         notes_join_group = ["加入群聊", "加入了群聊", "invited", "joined", "移出了群聊"]
         notes_bot_join_group = ["邀请你", "invited you", "You've joined", "你通过扫描"]
 
         self.client = client
         msg_type = self.msg_data['MsgType']
-    
-        self.from_user_id = self.msg_data['FromUserName']['string']
-        self.to_user_id = self.msg_data['ToUserName']['string']
+        self.reply_context = self.msg_data.get('ReplyContext', {})
+        self.message_context = self.msg_data.get('MessageContext', {})
+        self.app_info = self.msg_data.get('App', {})
+        self.image_info = self.msg_data.get('Image', {})
+        self.video_info = self.msg_data.get('Video', {})
+        self.file_info = self.msg_data.get('File', {})
+        self.voice_info = self.msg_data.get('Voice', {})
+        self.message_kind = str(self.msg_data.get('Kind', '') or '').lower()
+
+        # 兼容新旧API: 新API使用'str', 旧API使用'string'
+        from_user_dict = self.msg_data['FromUserName']
+        self.from_user_id = from_user_dict.get('str', from_user_dict.get('string', ''))
+        to_user_dict = self.msg_data['ToUserName']
+        self.to_user_id = to_user_dict.get('str', to_user_dict.get('string', ''))
         self.other_user_id = self.from_user_id
         # 检查是否是公众号等非用户账号的消息
         content_dict = self.msg_data.get('Content', {})
@@ -97,17 +143,41 @@ class WechatPadProMessage(ChatMessage):
             logger.debug(f"[wxpad] detected non-user message from {self.from_user_id}: {self.content}")
             return
 
-        if msg_type == 1:  # Text message
+        if self.message_kind == 'file' and isinstance(self.file_info, dict) and self.file_info:
+            # wechatpad.message.v2 provides the file metadata and the exact
+            # /Tools/DownloadFile request body separately from the old XML.
+            import os
+            self.ctype = ContextType.FILE
+            file_name = (
+                self.file_info.get('file_name')
+                or self.file_info.get('name')
+                or self.file_info.get('title')
+                or f"file_{uuid.uuid4()}"
+            )
+            file_name = os.path.basename(str(file_name)) or f"file_{uuid.uuid4()}"
+            self.content = TmpDir().path() + file_name
+            self._prepare_fn = self.download_file
+        elif msg_type == 1:  # Text message
             self.ctype = ContextType.TEXT
             content_dict = self.msg_data.get('Content', {})
             self.content = content_dict.get('str', content_dict.get('string', ''))
         elif msg_type == 34:  # Voice message
-            self.ctype = ContextType.VOICE
-            # 生成语音文件路径
-            silk_file_name = f"voice_{uuid.uuid4()}.silk"
-            self.content = TmpDir().path() + silk_file_name
-            # 设置延迟下载函数
-            self._prepare_fn = self.download_voice
+            content_dict = self.msg_data.get('Content', {})
+            voice_text = content_dict.get('str', content_dict.get('string', ''))
+            # MAX can download and transcribe the SILK message server-side, then
+            # dispatch the transcript while retaining WeChat's original type=34.
+            # A non-XML payload is therefore already usable text and must not be
+            # sent through the legacy XML voice downloader again.
+            if isinstance(voice_text, str) and voice_text.strip() and not voice_text.lstrip().startswith('<'):
+                self.ctype = ContextType.TEXT
+                self.content = voice_text.strip()
+            else:
+                self.ctype = ContextType.VOICE
+                # 生成语音文件路径
+                silk_file_name = f"voice_{uuid.uuid4()}.silk"
+                self.content = TmpDir().path() + silk_file_name
+                # 设置延迟下载函数
+                self._prepare_fn = self.download_voice
         elif msg_type == 43:  # Video message
             self.ctype = ContextType.VIDEO
             # 生成视频文件路径
@@ -119,6 +189,11 @@ class WechatPadProMessage(ChatMessage):
             self.ctype = ContextType.IMAGE
             self.content = TmpDir().path() + str(self.msg_id) + ".png"
             self._prepare_fn = self.download_image
+        elif msg_type == 48 or self.message_kind == 'location':
+            self.ctype = ContextType.TEXT
+            content_dict = self.msg_data.get('Content', {})
+            raw_content = content_dict.get('str', content_dict.get('string', ''))
+            self.content = self._parse_location_content(raw_content)
         elif msg_type == 49:  # 引用消息，小程序，公众号等
             # After getting content_xml
             content_dict = self.msg_data.get('Content', {})
@@ -180,7 +255,7 @@ class WechatPadProMessage(ChatMessage):
                     self.content = content_xml
             except ET.ParseError:
                 self.ctype = ContextType.TEXT
-                self.content = content_xml
+                self.content = self._format_message_context(content_xml)
         elif msg_type == 51:
             self.ctype = ContextType.STATUS_SYNC
             content_dict = self.msg_data.get('Content', {})
@@ -286,6 +361,11 @@ class WechatPadProMessage(ChatMessage):
             # 系统提示消息设置为文本类型但不处理
             self.ctype = ContextType.TEXT
             self.content = content
+        elif msg_type == 42 or self.message_kind == 'contact':
+            content_dict = self.msg_data.get('Content', {})
+            content = content_dict.get('str', content_dict.get('string', ''))
+            self.ctype = ContextType.TEXT
+            self.content = self._parse_contact_content(content)
         elif msg_type == 47:
             self.ctype = ContextType.EMOJI
             content_dict = self.msg_data.get('Content', {})
@@ -390,7 +470,10 @@ class WechatPadProMessage(ChatMessage):
             else:
                 content_text = str(content_str)
             
-            if ':' in content_text:
+            explicit_actual_user = self.msg_data.get('ActualUserName', '')
+            if explicit_actual_user:
+                self.actual_user_id = explicit_actual_user
+            elif ':' in content_text:
                 self.actual_user_id = content_text.split(':', 1)[0]
             else:
                 self.actual_user_id = ''
@@ -399,47 +482,325 @@ class WechatPadProMessage(ChatMessage):
             try:
                 from channel.chat_channel import get_group_member_display_name
                 self.actual_user_nickname = get_group_member_display_name(self.from_user_id, self.actual_user_id) or self.actual_user_id
+                self.self_display_name = (
+                    get_group_member_display_name(self.from_user_id, self.to_user_id)
+                    or self.self_display_name
+                )
             except Exception as e:
                 logger.warning(f"[wxpad] Failed to get group member display name: {e}")
                 self.actual_user_nickname = self.actual_user_id
 
-            # 检查是否被@：优先XML解析，失败则检查内容
-            self.is_at = False
-            msg_source = self.msg_data.get('MsgSource', '')
-            
+            # 检查是否被@：MAX优先使用结构化提及字段，旧API继续兼容
+            # MsgSource XML。不能依赖正文中的“@昵称”，因为MAX可能已清理它。
+            explicit_is_at = self.msg_data.get('IsAt', self.msg_data.get('IsMentioned', False))
+            self.is_at = self._as_bool(explicit_is_at)
+            mentioned_user_ids = self._collect_mentioned_user_ids(
+                self.msg_data.get('MentionedUserIDs'),
+                self.msg_data.get('AtUserList'),
+            )
+            if self.to_user_id and (
+                self.to_user_id in mentioned_user_ids or 'notify@all' in mentioned_user_ids
+            ):
+                self.is_at = True
+
+            # 兼容新旧API: 新API使用'msg_source', 旧API使用'MsgSource'
+            msg_source = self.msg_data.get('msg_source', self.msg_data.get('MsgSource', ''))
+
             # 尝试从XML解析@列表
             if msg_source:
                 try:
-                    root = ET.fromstring(msg_source)
+                    # 清理XML: 移除</msgsource>后面的内容(如<webhook_pushed>)
+                    msgsource_end = msg_source.find('</msgsource>')
+                    if msgsource_end != -1:
+                        clean_msg_source = msg_source[:msgsource_end + len('</msgsource>')]
+                    else:
+                        clean_msg_source = msg_source
+
+                    logger.debug(f"[wxpad_message] 清理后XML长度: {len(clean_msg_source)}")
+                    root = ET.fromstring(clean_msg_source)
                     atuserlist_elem = root.find('atuserlist')
                     if atuserlist_elem is not None and atuserlist_elem.text:
-                        self.is_at = self.to_user_id in atuserlist_elem.text
-                except ET.ParseError:
+                        xml_mentions = self._collect_mentioned_user_ids(atuserlist_elem.text)
+                        if self.to_user_id in xml_mentions or 'notify@all' in xml_mentions:
+                            self.is_at = True
+                        logger.debug(f"[wxpad_message] XML解析@: to_user_id={self.to_user_id}, atuserlist={atuserlist_elem.text}, is_at={self.is_at}")
+                    else:
+                        logger.debug(f"[wxpad_message] 未找到atuserlist或为空")
+                except ET.ParseError as e:
+                    logger.debug(f"[wxpad_message] XML解析失败: {e}, 使用后备逻辑")
                     # XML解析失败，检查消息内容
                     push_content = self.msg_data.get('PushContent', '')
                     original_content_dict = self.msg_data.get('Content', {})
                     original_content = original_content_dict.get('str', original_content_dict.get('string', ''))
                     at_indicators = ['在群聊中@了你', '@小艾', '@' + self.to_user_id]
-                    self.is_at = any(indicator in push_content or indicator in original_content 
-                                   for indicator in at_indicators)
+                    self.is_at = self.is_at or any(
+                        indicator in push_content or indicator in original_content
+                        for indicator in at_indicators
+                    )
+                    logger.debug(f"[wxpad_message] 内容检查@: push_content={push_content[:50]}, is_at={self.is_at}")
+            else:
+                logger.debug(f"[wxpad_message] msg_source为空,无法检测@")
+
+            # MAX 的引用/app 消息有时只在正文保留“@群昵称”，没有结构化
+            # mentioned_user_ids。仅对 type=49 使用群成员缓存中的机器人展示名
+            # 做兜底，避免把普通群文本中的任意 @ 都误判为触发消息。
+            if not self.is_at and msg_type == 49 and self.self_display_name:
+                textual_at = re.compile(
+                    rf"^@{re.escape(self.self_display_name)}(?:[\u2005 ]+|(?=\r?\n)|$)"
+                )
+                if textual_at.search(str(self.content or '')):
+                    self.is_at = True
+
+            logger.info(
+                f"[wxpad] 群聊触发检测: is_at={self.is_at}, "
+                f"mentioned_user_ids={mentioned_user_ids}"
+            )
             # 清理群聊消息格式
             self.content = str(self.content)
             if self.actual_user_id:
                 self.content = re.sub(f'{re.escape(self.actual_user_id)}:\n', '', self.content)
             self.content = re.sub(r'@[^\u2005]+\u2005', '', self.content)
+            if self.is_at and self.self_display_name:
+                self.content = re.sub(
+                    rf"^@{re.escape(self.self_display_name)}(?:[\u2005 ]+|(?=\r?\n)|$)",
+                    '',
+                    self.content,
+                    count=1,
+                ).lstrip()
         else:
             # 私聊消息：统一字段设置
             self.actual_user_id = self.other_user_id
             self.actual_user_nickname = self.other_user_nickname
 
-        self.my_msg = self.msg.get('Wxid') == self.from_user_id
+        self.my_msg = bool(self.msg_data.get('IsOutgoing')) or self.msg.get('Wxid') == self.from_user_id
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {'1', 'true', 'yes', 'y'}
+        return False
+
+    @classmethod
+    def _collect_mentioned_user_ids(cls, *values):
+        """Flatten MAX/legacy mention values into a set of account IDs."""
+        result = set()
+
+        def collect(value):
+            if value is None:
+                return
+            if isinstance(value, str):
+                result.update(
+                    item for item in re.split(r'[,;\s]+', value.strip()) if item
+                )
+                return
+            if isinstance(value, dict):
+                for nested in value.values():
+                    collect(nested)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for nested in value:
+                    collect(nested)
+
+        for value in values:
+            collect(value)
+        return result
+
+    @staticmethod
+    def _scalar_text(value):
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, dict):
+            for key in ('str', 'string', 'text', 'value'):
+                nested = value.get(key)
+                if isinstance(nested, (str, int, float)):
+                    return str(nested).strip()
+        return ''
+
+    @classmethod
+    def _find_context_value(cls, value, *names):
+        """Find one scalar in MAX ``message_context`` regardless of key casing."""
+        wanted = {name.lower() for name in names}
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if str(key).lower() in wanted:
+                    text = cls._scalar_text(nested)
+                    if text:
+                        return text
+            for nested in value.values():
+                text = cls._find_context_value(nested, *names)
+                if text:
+                    return text
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                text = cls._find_context_value(nested, *names)
+                if text:
+                    return text
+        return ''
+
+    def _format_message_context(self, default_content=''):
+        """Render the useful text fields exposed by MAX for non-XML app messages."""
+        parts = []
+        default_text = self._scalar_text(default_content)
+        if default_text and not default_text.startswith('<'):
+            parts.append(default_text)
+        for names in (
+            ('title',),
+            ('topic',),
+            ('text', 'description'),
+            ('url',),
+        ):
+            text = self._find_context_value(self.message_context, *names)
+            if text and text not in parts:
+                parts.append(text)
+        quote_content = self._find_context_value(
+            self.message_context, 'quote_content', 'quoted_content'
+        ) or self._find_context_value(
+            self.reply_context, 'quote_content', 'quoted_content'
+        )
+        if (
+            quote_content
+            and not quote_content.lstrip().startswith('<')
+            and quote_content not in parts
+        ):
+            display_name = self._find_context_value(
+                self.message_context, 'display_name', 'displayname', 'from_user_id'
+            ) or self._find_context_value(
+                self.reply_context, 'display_name', 'displayname'
+            ) or '对方'
+            quote_text = f"[引用了 {display_name} 的{quote_content}]"
+            if quote_text not in parts:
+                parts.append(quote_text)
+        return '\n'.join(parts) if parts else default_text
+
+    def _parse_contact_content(self, content):
+        nickname = self._find_context_value(
+            self.message_context, 'nickname', 'nick_name', 'display_name', 'title', 'name'
+        )
+        username = self._find_context_value(
+            self.message_context, 'username', 'user_name', 'wxid'
+        )
+        text = self._scalar_text(content)
+        try:
+            xml_start = text.find('<msg')
+            if xml_start >= 0:
+                root = ET.fromstring(text[xml_start:])
+                nickname = nickname or root.get('nickname', '') or root.get('fullpy', '')
+                username = username or root.get('username', '')
+        except ET.ParseError:
+            logger.debug('[wxpad] 名片XML解析失败，回退到结构化上下文')
+
+        label = nickname or username or text or '未知联系人'
+        if username and username != label:
+            label = f"{label} ({username})"
+        return f"[名片] {label}"
+
+    def _parse_location_content(self, content):
+        place = self._find_context_value(
+            self.message_context, 'label', 'poiname', 'address', 'title', 'name'
+        )
+        longitude = self._find_context_value(self.message_context, 'x', 'longitude', 'lng')
+        latitude = self._find_context_value(self.message_context, 'y', 'latitude', 'lat')
+        text = self._scalar_text(content)
+        try:
+            xml_start = text.find('<msg')
+            if xml_start >= 0:
+                root = ET.fromstring(text[xml_start:])
+                location = root if root.tag == 'location' else root.find('.//location')
+                if location is not None:
+                    place = (
+                        place
+                        or location.get('label', '')
+                        or location.get('poiname', '')
+                    )
+                    longitude = longitude or location.get('x', '')
+                    latitude = latitude or location.get('y', '')
+        except ET.ParseError:
+            logger.debug('[wxpad] 位置XML解析失败，回退到结构化上下文')
+
+        if place:
+            return f"[位置] {place}"
+        if longitude or latitude:
+            return f"[位置] {longitude or '?'} , {latitude or '?'}"
+        return f"[位置] {text or '未知位置'}"
+
+    @staticmethod
+    def _media_response_base64(response, *preferred_keys):
+        if not isinstance(response, dict) or response.get("Code") != 200:
+            return ""
+        data = response.get("Data", {})
+        if isinstance(data, str):
+            return data
+        if not isinstance(data, dict):
+            return ""
+        for key in preferred_keys + (
+            "FileData", "fileData", "file_data", "Base64", "base64",
+            "Image", "image", "Video", "video", "File", "file",
+            "Voice", "voice",
+        ):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value.split(',', 1)[1] if value.startswith('data:') and ',' in value else value
+        return ""
+
+    def _save_voice_base64(self, voice_base64, voice_length=0):
+        import os
+        from voice.audio_convert import any_to_mp3
+
+        os.makedirs(os.path.dirname(self.content), exist_ok=True)
+        voice_data = base64.b64decode(voice_base64)
+        silk_file_path = self.content
+        with open(silk_file_path, "wb") as file:
+            file.write(voice_data)
+        logger.info(f"[wxpad] SILK文件保存成功: {silk_file_path}")
+
+        mp3_file_path = os.path.splitext(silk_file_path)[0] + ".mp3"
+        target_duration = voice_length / 1000.0 if voice_length > 0 else None
+        any_to_mp3(silk_file_path, mp3_file_path, target_duration=target_duration)
+        if os.path.exists(mp3_file_path):
+            os.remove(silk_file_path)
+            self.content = mp3_file_path
+            logger.info(f"[wxpad] 语音处理完成: {mp3_file_path}, 时长: {target_duration}秒")
+        else:
+            logger.warning(f"[wxpad] MP3转换失败，使用SILK文件: {silk_file_path}")
+        return os.path.exists(self.content)
 
     def download_voice(self):
         """通过API下载语音并转换为MP3"""
         try:
+            # 检查是否已经处理过(文件路径已经是MP3)
+            if self.content and self.content.endswith('.mp3'):
+                logger.debug(f"[wxpad] 语音文件已处理过: {self.content}")
+                return
+
             if not self.client:
                 logger.error("[wxpad] 没有客户端实例，无法下载语音")
-                return
+                return False
+
+            voice_context = {}
+            if isinstance(self.voice_info, dict):
+                candidate = self.voice_info.get('download_context', self.voice_info)
+                if isinstance(candidate, dict) and {
+                    'bufid', 'fromUserName', 'length', 'msgId'
+                }.issubset(candidate):
+                    voice_context = candidate
+            if voice_context:
+                response = self.client.download_voice_context(voice_context)
+                encoded = self._media_response_base64(response, 'Voice', 'voice')
+                if encoded:
+                    voice_length = int(
+                        self.voice_info.get('duration_ms')
+                        or self.voice_info.get('voice_length')
+                        or 0
+                    )
+                    return self._save_voice_base64(encoded, voice_length)
+                logger.error(f"[wxpad] v2语音下载API失败: {response}")
+                return False
 
             # 从XML内容中解析语音参数
             content_dict = self.msg_data.get('Content', {})
@@ -496,34 +857,7 @@ class WechatPadProMessage(ChatMessage):
                     voice_base64 = voice_response.get("Data", {}).get("Base64")
                     
                     if voice_base64:
-                        import base64
-                        import os
-                        from voice.audio_convert import any_to_mp3
-                        
-                        # 解码Base64获取SILK数据
-                        voice_data = base64.b64decode(voice_base64)
-                        
-                        # 保存SILK文件
-                        silk_file_path = self.content
-                        with open(silk_file_path, "wb") as f:
-                            f.write(voice_data)
-                        
-                        logger.info(f"[wxpad] SILK文件保存成功: {silk_file_path}")
-                        
-                        # 转换为MP3，传入目标时长（毫秒转秒）
-                        mp3_file_path = os.path.splitext(silk_file_path)[0] + ".mp3"
-                        target_duration = voice_length / 1000.0 if voice_length > 0 else None
-                        any_to_mp3(silk_file_path, mp3_file_path, target_duration=target_duration)
-                        
-                        # 使用MP3文件
-                        if os.path.exists(mp3_file_path):
-                            # 转换成功后删除原始SILK文件，因为我们只需要MP3文件
-                            os.remove(silk_file_path)  # 删除临时SILK文件
-                            # 直接将self.content更新为MP3文件路径
-                            self.content = mp3_file_path
-                            logger.info(f"[wxpad] 语音处理完成: {mp3_file_path}, 时长: {target_duration}秒")
-                        else:
-                            logger.warning(f"[wxpad] MP3转换失败，使用SILK文件: {silk_file_path}")
+                        return self._save_voice_base64(voice_base64, voice_length)
                     else:
                         logger.error("[wxpad] API响应中没有Base64语音数据")
                 else:
@@ -534,6 +868,7 @@ class WechatPadProMessage(ChatMessage):
                 
         except Exception as e:
             logger.error(f"[wxpad] 语音文件下载异常: {e}", exc_info=True)
+        return False
 
     def _extract_cdn_info_from_xml(self, xml_content: str) -> dict:
         """从XML内容中提取图片CDN信息"""
@@ -563,21 +898,78 @@ class WechatPadProMessage(ChatMessage):
             return {}
 
     def download_image(self):
-        """下载图片使用wxpad库的CDN接口"""
+        """优先按 v2 结构化上下文下载图片，旧消息回退到 XML。"""
         try:
             import os
             
             if not self.client:
-                return
+                return False
+
+            if isinstance(self.image_info, dict) and self.image_info:
+                md5 = self.image_info.get('md5') or self.image_info.get('file_md5')
+                if md5:
+                    self.content = TmpDir().path() + str(md5) + ".jpg"
+                if os.path.exists(self.content):
+                    return True
+
+                cdn_contexts = self.image_info.get('cdn_download_contexts', {})
+                ordered_contexts = []
+                if isinstance(cdn_contexts, dict):
+                    if cdn_contexts.get('file_no') and cdn_contexts.get('file_aes_key'):
+                        ordered_contexts.append(cdn_contexts)
+                    for variant in ('original', 'standard', 'thumbnail'):
+                        context = cdn_contexts.get(variant)
+                        if isinstance(context, dict) and context:
+                            ordered_contexts.append(context)
+                    ordered_contexts.extend(
+                        context for variant, context in cdn_contexts.items()
+                        if variant not in ('original', 'standard', 'thumbnail')
+                        and isinstance(context, dict) and context
+                    )
+                elif isinstance(cdn_contexts, list):
+                    priority = {'original': 0, 'standard': 1, 'thumbnail': 2}
+                    ordered_contexts = sorted(
+                        (context for context in cdn_contexts if isinstance(context, dict) and context),
+                        key=lambda context: priority.get(
+                            str(context.get('variant', '')).lower(), 3
+                        ),
+                    )
+
+                for context in ordered_contexts:
+                    result = self.client.download_cdn_image(context)
+                    encoded = self._media_response_base64(result, 'Image', 'image')
+                    if encoded and self._save_image_data(encoded):
+                        variant = context.get('variant', 'unknown')
+                        logger.info(
+                            f"[wxpad] v2图片CDN下载成功: {self.content}, variant={variant}"
+                        )
+                        return True
+                    logger.warning(
+                        "[wxpad] v2图片CDN下载失败: "
+                        f"variant={context.get('variant', 'unknown')}, "
+                        f"code={result.get('Code') if isinstance(result, dict) else 'invalid'}, "
+                        f"message={result.get('Message') if isinstance(result, dict) else ''}"
+                    )
+
+                download_context = self.image_info.get('download_context')
+                if isinstance(download_context, dict) and download_context:
+                    result = self.client.download_image_context(download_context)
+                    encoded = self._media_response_base64(result)
+                    if encoded and self._save_image_data(encoded):
+                        logger.info(f"[wxpad] v2图片分片下载成功: {self.content}")
+                        return True
+                    logger.error(f"[wxpad] v2图片下载API失败: {result}")
+                    return False
 
             content_dict = self.msg_data.get('Content', {})
             content_xml = content_dict.get('str', content_dict.get('string', ''))
             if not content_xml:
-                return
+                logger.error("[wxpad] 图片消息缺少 v2 下载上下文和旧版 XML")
+                return False
 
             cdn_info = self._extract_cdn_info_from_xml(content_xml)
             if not cdn_info.get('aes_key'):
-                return
+                return False
 
             # 使用MD5作为文件名，方便查找
             if cdn_info.get('md5'):
@@ -589,7 +981,7 @@ class WechatPadProMessage(ChatMessage):
             # 检查文件是否已存在，避免重复下载
             if os.path.exists(self.content):
                 logger.info(f"[wxpad] 图片文件已存在: {self.content}")
-                return
+                return True
 
             # 按优先级尝试下载：高清 -> 正常 -> 缩略图
             download_urls = [
@@ -612,10 +1004,11 @@ class WechatPadProMessage(ChatMessage):
                     image_data = result.get("Data", {}).get("FileData")
                     if image_data and self._save_image_data(image_data):
                         logger.info(f"[wxpad] 图片下载成功: {self.content}")
-                        return
+                        return True
                 
         except Exception as e:
             logger.error(f"[wxpad] 图片下载异常: {e}")
+        return False
 
     def download_refer_image(self):
         """下载引用图片消息中的图片"""
@@ -696,9 +1089,23 @@ class WechatPadProMessage(ChatMessage):
             if not image_bytes:
                 return False
 
-            # 强制使用JPG扩展名
+            # Keep the filename and MIME type aligned with the downloaded
+            # bytes.  Vision providers may reject a PNG payload advertised as
+            # image/jpeg (the legacy implementation forced every file to JPG).
+            extension = ".jpg"
+            if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                extension = ".png"
+            elif image_bytes.startswith((b"GIF87a", b"GIF89a")):
+                extension = ".gif"
+            elif (
+                len(image_bytes) >= 12
+                and image_bytes.startswith(b"RIFF")
+                and image_bytes[8:12] == b"WEBP"
+            ):
+                extension = ".webp"
+
             base_path = os.path.splitext(self.content)[0]
-            self.content = base_path + ".jpg"
+            self.content = base_path + extension
 
             with open(self.content, 'wb') as f:
                 f.write(image_bytes)
@@ -740,14 +1147,28 @@ class WechatPadProMessage(ChatMessage):
             return {}
             
     def download_video(self):
-        """下载视频使用wxpad库的CDN接口"""
+        """优先按 v2 ``video.download_context`` 下载视频。"""
         try:
             import os
             import base64
             
             if not self.client:
                 logger.error("[wxpad] 没有客户端实例，无法下载视频")
-                return
+                return False
+
+            if isinstance(self.video_info, dict) and self.video_info:
+                download_context = self.video_info.get('download_context')
+                if isinstance(download_context, dict) and download_context:
+                    result = self.client.download_video_context(download_context)
+                    encoded = self._media_response_base64(result, 'Video', 'video')
+                    if encoded:
+                        os.makedirs(os.path.dirname(self.content), exist_ok=True)
+                        with open(self.content, 'wb') as file:
+                            file.write(base64.b64decode(encoded))
+                        logger.info(f"[wxpad] v2视频下载成功: {self.content}")
+                        return True
+                    logger.error(f"[wxpad] v2视频下载API失败: {result}")
+                    return False
 
             content_dict = self.msg_data.get('Content', {})
             content_xml = content_dict.get('str', content_dict.get('string', ''))
@@ -766,7 +1187,7 @@ class WechatPadProMessage(ChatMessage):
             
             # 检查文件是否已存在，避免重复下载
             if os.path.exists(self.content):
-                return
+                return True
 
             # 下载视频文件
             result = self.client.send_cdn_download(
@@ -783,6 +1204,7 @@ class WechatPadProMessage(ChatMessage):
                         with open(self.content, 'wb') as f:
                             f.write(base64.b64decode(video_data))
                         logger.info(f"[wxpad] 视频下载成功: {self.content}")
+                        return True
                     except Exception as e:
                         logger.error(f"[wxpad] 保存视频失败: {e}")
                 else:
@@ -792,16 +1214,31 @@ class WechatPadProMessage(ChatMessage):
                 
         except Exception as e:
             logger.error(f"[wxpad] 视频下载异常: {e}")
+        return False
 
     def download_file(self):
-        """下载文件使用wxpad库的CDN接口"""
+        """优先按 v2 ``file.download_context`` 下载文件。"""
         try:
             import os
             import base64
             
             if not self.client:
                 logger.error("[wxpad] 没有客户端实例，无法下载文件")
-                return
+                return False
+
+            if isinstance(self.file_info, dict) and self.file_info:
+                download_context = self.file_info.get('download_context')
+                if isinstance(download_context, dict) and download_context:
+                    result = self.client.download_file_context(download_context)
+                    encoded = self._media_response_base64(result, 'File', 'file')
+                    if encoded:
+                        os.makedirs(os.path.dirname(self.content), exist_ok=True)
+                        with open(self.content, 'wb') as file:
+                            file.write(base64.b64decode(encoded))
+                        logger.info(f"[wxpad] v2文件下载成功: {self.content}")
+                        return True
+                    logger.error(f"[wxpad] v2文件下载API失败: {result}")
+                    return False
 
             if not hasattr(self, '_file_info') or not self._file_info:
                 logger.error("[wxpad] 文件信息不存在")
@@ -820,7 +1257,7 @@ class WechatPadProMessage(ChatMessage):
             # 检查文件是否已存在，避免重复下载
             if os.path.exists(self.content):
                 logger.info(f"[wxpad] 文件已存在: {self.content}")
-                return
+                return True
 
             # 下载文件
             result = self.client.send_cdn_download(
@@ -837,6 +1274,7 @@ class WechatPadProMessage(ChatMessage):
                         with open(self.content, 'wb') as f:
                             f.write(base64.b64decode(file_data))
                         logger.info(f"[wxpad] 文件下载成功: {self.content} ({file_info.get('title')})")
+                        return True
                     except Exception as e:
                         logger.error(f"[wxpad] 保存文件失败: {e}", exc_info=True)
                 else:
@@ -846,10 +1284,12 @@ class WechatPadProMessage(ChatMessage):
                 
         except Exception as e:
             logger.error(f"[wxpad] 文件下载异常: {e}", exc_info=True)
+        return False
 
     def prepare(self):
         if self._prepare_fn:
-            self._prepare_fn()
+            return self._prepare_fn()
+        return None
             
     def _clear_image_cache_for_text(self):
         """为普通文本消息清理图片缓存，避免误用之前的多模态内容"""
@@ -1017,24 +1457,48 @@ class WechatPadProMessage(ChatMessage):
             
             # 检查文件是否已存在，避免重复下载
             if not os.path.exists(file_path):
-                # 临时设置文件信息和路径，复用现有下载逻辑
-                self._file_info = {
-                    'title': refer_file_info.get('title', ''),
-                    'fileext': file_ext,
-                    'attachid': refer_file_info.get('attachid', ''),
-                    'cdnattachurl': refer_file_info.get('cdnattachurl', ''),
-                    'aeskey': refer_file_info.get('aeskey', ''),
-                    'totallen': refer_file_info.get('totallen', '0'),
-                    'md5': refer_file_info.get('md5', '')
-                }
-                temp_content = self.content
-                self.content = file_path
-                
-                # 调用现有的文件下载方法
-                self.download_file()
-                
-                # 恢复原始内容
-                self.content = temp_content
+                is_max = (
+                    getattr(self.client, 'api_mode', '') == 'wechat08'
+                    or (
+                        callable(getattr(self.client, '_is_wechat08', None))
+                        and self.client._is_wechat08()
+                    )
+                )
+                if is_max:
+                    try:
+                        total_len = int(refer_file_info.get('totallen', 0) or 0)
+                    except (TypeError, ValueError):
+                        total_len = 0
+                    download_context = {
+                        'app_id': refer_file_info.get('appid', ''),
+                        'attach_id': refer_file_info.get('attachid', ''),
+                        'user_name': self.other_user_id,
+                        'data_len': total_len,
+                        'section': {'start_pos': 0, 'data_len': 1048576},
+                    }
+                    result = self.client.download_file_context(download_context)
+                    encoded = self._media_response_base64(result, 'File', 'file')
+                    if not encoded:
+                        logger.error(f"[wxpad] MAX引用文件下载失败: {result}")
+                        return
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                    with open(file_path, 'wb') as file:
+                        file.write(base64.b64decode(encoded))
+                else:
+                    # 旧服务仍按 CDN URL 下载；MAX 文件不能误走图片 CDN 接口。
+                    self._file_info = {
+                        'title': refer_file_info.get('title', ''),
+                        'fileext': file_ext,
+                        'attachid': refer_file_info.get('attachid', ''),
+                        'cdnattachurl': refer_file_info.get('cdnattachurl', ''),
+                        'aeskey': refer_file_info.get('aeskey', ''),
+                        'totallen': refer_file_info.get('totallen', '0'),
+                        'md5': refer_file_info.get('md5', '')
+                    }
+                    temp_content = self.content
+                    self.content = file_path
+                    self.download_file()
+                    self.content = temp_content
             
             # 检查文件是否下载成功
             if file_path and os.path.exists(file_path):
@@ -1156,6 +1620,13 @@ class WechatPadProMessage(ChatMessage):
             file_info = {
                 'file_type': '6',
                 'title': title,
+                'appid': (
+                    appattach.find('appid').text
+                    if appattach.find('appid') is not None
+                    else appmsg.get('appid', '') or (
+                        appmsg.find('appid').text if appmsg.find('appid') is not None else ''
+                    )
+                ),
                 'fileext': appattach.find('fileext').text if appattach.find('fileext') is not None else "",
                 'attachid': appattach.find('attachid').text if appattach.find('attachid') is not None else "",
                 'cdnattachurl': appattach.find('cdnattachurl').text if appattach.find('cdnattachurl') is not None else "",

@@ -29,11 +29,17 @@ from common.singleton import singleton
 from common.tmp_dir import TmpDir
 from config import conf, save_config
 from lib.wxpad.client import WxpadClient
+from lib.wxpad.message_adapter import extract_websocket_event, normalize_websocket_message
 from voice.audio_convert import mp3_to_silk
 
 MAX_UTF8_LEN = 2048
 ROBOT_STAT_PATH = os.path.join(os.path.dirname(__file__), '../../resource/robot_stat.json')
 ROBOT_STAT_PATH = os.path.abspath(ROBOT_STAT_PATH)
+RECENT_MESSAGE_CACHE_PATH = os.path.join(
+    os.path.dirname(__file__), '../../resource/wxpad_recent_messages.json'
+)
+RECENT_MESSAGE_CACHE_PATH = os.path.abspath(RECENT_MESSAGE_CACHE_PATH)
+RECENT_MESSAGE_CACHE_LIMIT = 500
 
 
 
@@ -84,12 +90,146 @@ class WxpadChannel(ChatChannel):
         self.ws_connected = False
         self.ws_reconnect_count = 0
         self.max_reconnect_attempts = 5
+        self.last_heartbeat_time = 0  # 最后收到心跳的时间戳
+        # 消息去重
+        self.processed_msg_ids = set()  # 已处理的消息ID集合
+        self.max_processed_msgs = 1000  # 最多保存1000条消息ID,防止内存溢出
+        self._recent_message_lock = threading.Lock()
+        self._recent_messages = self._load_recent_messages()
+        self._last_pad_login_progress = None
         logger.info(f"[WeChatPadPro] init: base_url: {self.base_url}, admin_key: {admin_key[:3]}***, user_key: {'已配置' if user_key else '未配置'}")
+
+    def _load_recent_messages(self):
+        try:
+            with open(RECENT_MESSAGE_CACHE_PATH, 'r', encoding='utf-8') as cache_file:
+                cached = json.load(cache_file)
+            if not isinstance(cached, dict):
+                return {}
+            items = list(cached.items())[-RECENT_MESSAGE_CACHE_LIMIT:]
+            return dict(items)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.warning(f"[wxpad] 读取最近消息缓存失败: {e}")
+            return {}
+
+    def _save_recent_messages(self):
+        try:
+            os.makedirs(os.path.dirname(RECENT_MESSAGE_CACHE_PATH), exist_ok=True)
+            temp_path = RECENT_MESSAGE_CACHE_PATH + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as cache_file:
+                json.dump(self._recent_messages, cache_file, ensure_ascii=False)
+            os.replace(temp_path, RECENT_MESSAGE_CACHE_PATH)
+        except Exception as e:
+            logger.warning(f"[wxpad] 保存最近消息缓存失败: {e}")
+
+    @staticmethod
+    def _message_cache_ids(xmsg):
+        msg_data = getattr(xmsg, 'msg_data', {})
+        raw_message = msg_data.get('RawMessage', {}) if isinstance(msg_data, dict) else {}
+        candidates = [
+            getattr(xmsg, 'msg_id', None),
+            msg_data.get('MsgId') if isinstance(msg_data, dict) else None,
+            msg_data.get('NewMsgId') if isinstance(msg_data, dict) else None,
+        ]
+        if isinstance(raw_message, dict):
+            candidates.extend(
+                raw_message.get(key) for key in ('id', 'msg_id', 'new_msg_id', 'svr_id')
+            )
+        return {str(value) for value in candidates if value not in (None, '', 0, '0')}
+
+    def _remember_message(self, xmsg):
+        content = str(getattr(xmsg, 'content', '') or '').strip()
+        ids = self._message_cache_ids(xmsg)
+        if not content or not ids:
+            return
+
+        entry = {
+            'content': content[:4000],
+            'sender_id': getattr(xmsg, 'actual_user_id', '') or getattr(xmsg, 'from_user_id', ''),
+            'sender_name': getattr(xmsg, 'actual_user_nickname', '') or '',
+            'msg_type': getattr(xmsg, 'msg_data', {}).get('MsgType', 0),
+        }
+        with self._recent_message_lock:
+            for msg_id in ids:
+                self._recent_messages.pop(msg_id, None)
+                self._recent_messages[msg_id] = entry
+            while len(self._recent_messages) > RECENT_MESSAGE_CACHE_LIMIT:
+                oldest = next(iter(self._recent_messages))
+                self._recent_messages.pop(oldest, None)
+            self._save_recent_messages()
+
+    def _restore_quoted_content(self, xmsg):
+        app_info = getattr(xmsg, 'app_info', {})
+        if not isinstance(app_info, dict) or app_info.get('category') != 'quote':
+            return
+        reference = app_info.get('reference', {})
+        if not isinstance(reference, dict):
+            return
+
+        reference_ids = [
+            str(reference.get(key))
+            for key in ('svr_id', 'new_msg_id', 'msg_id')
+            if reference.get(key) not in (None, '', 0, '0')
+        ]
+        cached = None
+        with self._recent_message_lock:
+            for reference_id in reference_ids:
+                cached = self._recent_messages.get(reference_id)
+                if isinstance(cached, dict):
+                    break
+
+        current_content = str(getattr(xmsg, 'content', '') or '').strip()
+        if not cached:
+            if not current_content:
+                xmsg.content = '[引用消息，但原消息不在本地最近消息缓存中]'
+            logger.warning(
+                f"[wxpad] 引用原消息未命中本地缓存: reference_ids={reference_ids}"
+            )
+            return
+
+        quoted_content = str(cached.get('content', '') or '').strip()
+        display_name = (
+            reference.get('display_name')
+            or cached.get('sender_name')
+            or reference.get('from_user_id')
+            or '对方'
+        )
+        quote_text = f"[引用了 {display_name} 的{quoted_content}]"
+        xmsg.content = f"{current_content}\n\n{quote_text}" if current_content else quote_text
+        logger.info(
+            f"[wxpad] 已从最近消息缓存恢复引用原文: reference_id={reference_ids[0] if reference_ids else ''}"
+        )
 
     def startup(self):
         self._ensure_login()
+        if self.client._is_wechat08():
+            self._start_max_realtime_services()
         logger.info(f"[wxpad] channel startup, wxid: {self.wxid}")
         threading.Thread(target=self._sync_message_loop, daemon=True).start()
+
+    def _start_max_realtime_services(self):
+        """Enable the MAX heartbeat and message synchronization workers."""
+        heartbeat_result = self.client.start_auto_heartbeat(self.client.user_key)
+        if heartbeat_result.get("Code") == 200:
+            logger.info("[wxpad] WeChatPadProMAX 自动心跳已启用")
+        else:
+            logger.warning(f"[wxpad] 启用 WeChatPadProMAX 自动心跳失败: {heartbeat_result}")
+
+        sync_result = self.client.start_auto_sync(self.client.user_key)
+        if sync_result.get("Code") != 200:
+            raise Exception(f"启用 WeChatPadProMAX 自动同步失败: {sync_result}")
+        logger.info("[wxpad] WeChatPadProMAX 自动消息同步已启用")
+
+    def _wait_for_max_long_link(self, timeout=20, interval=2):
+        """Wait briefly for MAX to register and connect its WeChat long link."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            result = self.client.get_iwx_connect(self.client.user_key)
+            if self.client.is_long_link_ready(result):
+                return True
+            time.sleep(interval)
+        return False
 
     def _ensure_login(self):
         """确保登录状态"""
@@ -146,13 +286,42 @@ class WxpadChannel(ChatChannel):
                         login_state = data.get("loginState")
                         if login_state == 1:  # 在线状态良好
                             logger.info(f"[wxpad] 账号在线状态良好: {data.get('loginErrMsg', '')}")
+                            # 缓存会话已经初始化，重复 Newinit 会被 MAX 后端拒绝。
+                            # Newinit 只在新的二维码登录成功后执行。
                             # 从状态文件加载wxid等信息
                             self._load_login_info()
                             return
                         else:
                             logger.info(f"[wxpad] 账号离线，状态: {login_state}, 消息: {data.get('loginErrMsg', '')}")
+                            if self.client._is_wechat08() and data.get("wxid"):
+                                logger.info("[wxpad] 检测到缓存会话，尝试重新初始化")
+                                try:
+                                    init_result = self.client.initialize_login(self.client.user_key)
+                                    if init_result.get("Code") == 200:
+                                        self._load_login_info()
+                                        logger.info(
+                                            "[wxpad] WeChatPadProMAX 缓存会话初始化成功，"
+                                            "继续启动实时连接"
+                                        )
+                                        return
+                                    logger.warning(
+                                        f"[wxpad] WeChatPadProMAX 缓存会话初始化失败: {init_result}"
+                                    )
+                                except Exception as recovery_error:
+                                    logger.warning(
+                                        f"[wxpad] WeChatPadProMAX 缓存会话初始化异常: {recovery_error}"
+                                    )
                     else:
                         logger.warning(f"[wxpad] 检查登录状态失败: {status_result}")
+                        if (
+                            self.client._is_wechat08()
+                            and status_result.get("CodeValue") == "INVALID_CREDENTIAL"
+                        ):
+                            logger.info("[wxpad] 当前授权码无效，使用管理员 TokenKey 重新生成授权码")
+                            if not self._generate_user_key():
+                                raise Exception("生成 WeChatPadProMAX 授权码失败")
+                            self._qr_code_login()
+                            return
                 else:
                     logger.warning(f"[wxpad] 登录状态检查异常: {result_data}")
             except queue.Empty:
@@ -160,6 +329,13 @@ class WxpadChannel(ChatChannel):
 
         except Exception as e:
             logger.warning(f"[wxpad] 检查在线状态异常: {e}")
+
+        # MAX 的 Awaken 在长连接已经失效时可能阻塞数分钟后仍返回
+        # MM_ERR_SYS。缓存恢复已经在上面尝试过，失败后直接重新扫码更可靠。
+        if self.client._is_wechat08():
+            logger.info("[wxpad] MAX 缓存会话无法恢复，直接进入二维码登录流程")
+            self._qr_code_login()
+            return
 
         # 4. 尝试唤醒登录
         try:
@@ -296,20 +472,87 @@ class WxpadChannel(ChatChannel):
             except Exception as e:
                 logger.error(f"[wxpad] 获取个人资料异常: {e}")
 
-    def _poll_status(self, api_call_func, success_condition_func, timeout, interval, description):
+    def _save_pad_qr_image(self, encoded_value, filename):
+        """Persist a QR image returned by MAX so an operator can scan it."""
+        value = str(encoded_value or "").strip()
+        if not value:
+            return None
+        if value.startswith("data:image") and "," in value:
+            value = value.split(",", 1)[1]
+        elif value.startswith(("http://", "https://")):
+            return None
+
+        try:
+            image_data = base64.b64decode(value)
+            output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../runtime"))
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, filename)
+            with open(output_path, "wb") as image_file:
+                image_file.write(image_data)
+            return output_path
+        except Exception as exc:
+            logger.warning(f"[wxpad] 保存 Pad 二维码失败: {exc}")
+            return None
+
+    def _report_pad_login_progress(self, result):
+        data = result.get("Data", {}) if isinstance(result, dict) else {}
+        data = data if isinstance(data, dict) else {}
+        status = str(data.get("status") or "")
+        target = data.get("verification_url") or data.get("verification_path") or ""
+        signature = (
+            status,
+            data.get("challenge_id") or "",
+            target,
+            bool(data.get("ready")),
+            bool(data.get("requires_face_verification")),
+            bool(data.get("requires_slider_verification")),
+        )
+        if signature == self._last_pad_login_progress:
+            return
+        self._last_pad_login_progress = signature
+
+        if data.get("requires_face_verification") or data.get("requires_slider_verification"):
+            method = "滑块" if data.get("requires_slider_verification") else "人脸"
+            logger.warning(f"[wxpad] Pad 登录需要{method}验证，状态: {status or 'preparing'}")
+            if target:
+                logger.warning(f"[wxpad] Pad {method}验证地址: {target}")
+            qr_path = self._save_pad_qr_image(
+                data.get("verification_qr_base64"),
+                "pad-face-qr.png",
+            )
+            if qr_path:
+                logger.warning(f"[wxpad] Pad {method}二维码已保存: {qr_path}")
+            hint = data.get("network_hint")
+            if hint:
+                logger.info(f"[wxpad] Pad 验证网络提示: {hint}")
+        elif status in ("scanned", "resuming_login", "completed"):
+            logger.info(f"[wxpad] Pad 登录进度: {status}")
+
+    def _poll_status(
+        self,
+        api_call_func,
+        success_condition_func,
+        timeout,
+        interval,
+        description,
+        progress_callback=None,
+    ):
         """通用轮询状态辅助函数"""
         start_time = time.time()
         logger.info(f"[wxpad] 开始轮询: {description}，超时时间: {timeout}秒")
-        
+
         while time.time() - start_time < timeout:
             try:
                 result = api_call_func()
                 logger.debug(f"[wxpad] 轮询结果 ({description}): {result}")
-                
+
+                if progress_callback:
+                    progress_callback(result)
+
                 if success_condition_func(result):
                     logger.info(f"[wxpad] 轮询成功: {description}")
                     return True, result.get("Data", {})
-                
+
                 # 轮询状态提示
                 remaining = int(timeout - (time.time() - start_time))
                 if remaining > 0 and remaining % 30 == 0:
@@ -317,9 +560,9 @@ class WxpadChannel(ChatChannel):
 
             except Exception as e:
                 logger.error(f"[wxpad] 轮询异常 ({description}): {e}")
-            
+
             time.sleep(interval)
-            
+
         logger.warning(f"[wxpad] 轮询超时: {description}")
         return False, None
 
@@ -352,42 +595,54 @@ class WxpadChannel(ChatChannel):
             # 从返回结果中提取二维码信息（根据实际API返回格式调整）
             data = qr_result.get("Data", {})
             qr_url = data.get("QrCodeUrl") or data.get("qrUrl") or data.get("QrUrl") or data.get("url")
+            qr_base64 = data.get("QrBase64") or data.get("qr_base64")
 
-            if not qr_url:
+            if not qr_url and not qr_base64:
                 logger.error(f"[wxpad] 未获取到二维码链接，返回内容: {qr_result}")
                 raise Exception("Failed to get QR code URL")
+
+            qr_image_path = self._save_pad_qr_image(qr_base64, "pad-login-qr.png")
+            if qr_image_path:
+                logger.info(f"[wxpad] Pad 登录二维码已保存: {qr_image_path}")
 
             # API建议自定义生成二维码，以提高稳定性和效率。我们解析出原始微信登录链接进行处理。
             try:
                 import urllib.parse
-                parsed_url = urllib.parse.urlparse(qr_url)
-                query_params = urllib.parse.parse_qs(parsed_url.query)
-                # 优先使用'url'参数中的链接，如果不存在则使用原始链接
-                final_qr_data = query_params.get('url', [qr_url])[0]
-                logger.info(f"[wxpad] 提取用于生成二维码的链接: {final_qr_data}")
+                final_qr_data = None
+                if qr_url:
+                    parsed_url = urllib.parse.urlparse(qr_url)
+                    query_params = urllib.parse.parse_qs(parsed_url.query)
+                    # 优先使用'url'参数中的链接，如果不存在则使用原始链接
+                    final_qr_data = query_params.get('url', [qr_url])[0]
+                    logger.info(f"[wxpad] 提取用于生成二维码的链接: {final_qr_data}")
             except Exception as e:
                 logger.warning(f"[wxpad] 解析二维码链接失败，将使用原始链接: {e}")
                 final_qr_data = qr_url
 
-            logger.info(f"[wxpad] 请扫码登录: {final_qr_data}")
+            if final_qr_data:
+                logger.info(f"[wxpad] 请扫码登录: {final_qr_data}")
+            elif qr_image_path:
+                logger.info(f"[wxpad] 请扫描 Pad 登录二维码文件: {qr_image_path}")
 
             # 控制台渲染二维码
             try:
                 import qrcode
-                qr = qrcode.QRCode(border=1)
-                qr.add_data(final_qr_data)
-                qr.make(fit=True)
-                qr.print_ascii(out=sys.stdout)
+                if final_qr_data:
+                    qr = qrcode.QRCode(border=1)
+                    qr.add_data(final_qr_data)
+                    qr.make(fit=True)
+                    qr.print_ascii(out=sys.stdout)
             except Exception as e:
                 logger.warning(f"[wxpad] 控制台二维码渲染失败: {e}")
-            
+
             # 使用轮询辅助函数等待扫码登录
             success, login_data = self._poll_status(
                 api_call_func=lambda: self.client.check_login_status(self.client.user_key),
                 success_condition_func=lambda res: res.get("Code") == 200 and res.get("Data", {}).get("loginState") == 1,
-                timeout=240,
+                timeout=600,
                 interval=2,
-                description="扫码登录"
+                description="Pad 扫码及人脸验证",
+                progress_callback=self._report_pad_login_progress,
             )
 
             if success:
@@ -402,6 +657,7 @@ class WxpadChannel(ChatChannel):
 
     def _save_login_success(self):
         """保存登录成功后的信息"""
+        self._initialize_session()
         try:
             # 获取个人资料信息来获取wxid
             profile_result = self.client.get_profile(self.client.user_key)
@@ -423,6 +679,16 @@ class WxpadChannel(ChatChannel):
                 logger.warning(f"[wxpad] 获取个人资料失败: {profile_result}")
         except Exception as e:
             logger.error(f"[wxpad] 保存登录信息失败: {e}")
+
+    def _initialize_session(self):
+        """初始化登录会话；MAX 后端要求扫码成功后显式调用 Newinit。"""
+        if not self.client._is_wechat08():
+            return
+
+        result = self.client.initialize_login(self.client.user_key)
+        if result.get("Code") != 200:
+            raise Exception(f"WeChatPadProMAX 初始化失败: {result.get('Message', result)}")
+        logger.info("[wxpad] WeChatPadProMAX 初始化成功")
 
     def _sync_message_loop(self):
         """消息同步循环 - 使用WebSocket"""
@@ -454,7 +720,12 @@ class WxpadChannel(ChatChannel):
         try:
             # 获取WebSocket URL
             ws_url = self.client.get_websocket_url(self.client.user_key)
-            logger.info(f"[wxpad] 连接WebSocket: {ws_url}")
+            safe_ws_url = ws_url
+            if 'authcode=' in safe_ws_url:
+                prefix, auth_part = safe_ws_url.split('authcode=', 1)
+                suffix = '&' + auth_part.split('&', 1)[1] if '&' in auth_part else ''
+                safe_ws_url = f"{prefix}authcode=***{suffix}"
+            logger.info(f"[wxpad] 连接WebSocket: {safe_ws_url}")
 
             # 创建WebSocket连接
             self.ws = websocket.WebSocketApp(
@@ -482,51 +753,86 @@ class WxpadChannel(ChatChannel):
         """WebSocket消息接收回调"""
         try:
             logger.debug(f"[wxpad] 收到WebSocket消息: {message}")
-
-            # 解析消息
             data = json.loads(message)
+            event_type, messages, metadata = extract_websocket_event(data)
 
-            # WebSocket消息格式：直接是消息对象，不像HTTP那样包装在Code/Data中
-            if isinstance(data, dict) and 'msg_id' in data:
-                # 单条消息处理
-                try:
-                    from_user = self._extract_str(data.get('from_user_name', {}))
-                    msg_type = data.get('msg_type', 1)
-
-                    # 简化显示信息，不调用API获取昵称
-                    if "@chatroom" in from_user:
-                        # 群聊消息 - 只显示ID，避免重复API调用
-                        logger.info(f"[wxpad] 处理WebSocket消息: from={from_user}, type={msg_type}")
-                    else:
-                        # 私聊消息 - 只显示ID，避免重复API调用
-                        logger.info(f"[wxpad] 处理WebSocket消息: from={from_user}, type={msg_type}")
-
-                    # 转换并处理消息
-                    standard_msg = self._convert_message(data)
-                    self._handle_message(standard_msg)
-                except Exception as e:
-                    logger.error(f"[wxpad] 处理WebSocket消息异常: {e}")
-            elif isinstance(data, list):
-                # 多条消息处理
-                logger.info(f"[wxpad] 收到 {len(data)} 条WebSocket消息")
-                for i, msg in enumerate(data):
+            if messages:
+                logger.info(f"[wxpad] 收到 {len(messages)} 条WebSocket业务消息")
+                for index, raw_message in enumerate(messages, 1):
                     try:
-                        from_user = self._extract_str(msg.get('from_user_name', {}))
-                        msg_type = msg.get('msg_type', 1)
+                        if metadata.get('schema') and 'schema' not in raw_message:
+                            raw_message = dict(raw_message)
+                            raw_message['schema'] = metadata.get('schema')
+                        standard_msg = self._convert_message(raw_message)
+                        msg_id = standard_msg.get('NewMsgId') or standard_msg.get('MsgId')
+                        if msg_id and msg_id in self.processed_msg_ids:
+                            logger.debug(f"[wxpad] 忽略重复消息 {index}: msg_id={msg_id}")
+                            continue
 
-                        # 简化显示信息，不调用API获取昵称
-                        if "@chatroom" in from_user:
-                            # 群聊消息 - 只显示ID，避免重复API调用
-                            logger.info(f"[wxpad] 处理消息 {i+1}: from={from_user}, type={msg_type}")
-                        else:
-                            # 私聊消息 - 只显示ID，避免重复API调用
-                            logger.info(f"[wxpad] 处理消息 {i+1}: from={from_user}, type={msg_type}")
+                        if msg_id:
+                            self.processed_msg_ids.add(msg_id)
+                            if len(self.processed_msg_ids) > self.max_processed_msgs:
+                                msg_list = list(self.processed_msg_ids)
+                                self.processed_msg_ids = set(msg_list[len(msg_list) // 2:])
+                                logger.debug(f"[wxpad] 清理消息ID缓存,保留 {len(self.processed_msg_ids)} 条")
 
-                        # 转换并处理消息
-                        standard_msg = self._convert_message(msg)
+                        logger.info(
+                            f"[wxpad] 处理消息 {index}: "
+                            f"from={standard_msg.get('FromUserName')}, "
+                            f"type={standard_msg.get('MsgType')}, msg_id={msg_id}"
+                        )
                         self._handle_message(standard_msg)
                     except Exception as e:
-                        logger.error(f"[wxpad] 处理消息 {i+1} 异常: {e}")
+                        logger.exception(f"[wxpad] 处理消息 {index} 异常: {e}")
+            elif event_type == 'sync_update':
+                logger.debug(
+                    "[wxpad] 同步状态更新: contact_changed=%s, profiles_changed=%s, switches_changed=%s",
+                    metadata.get('contacts_changed', metadata.get('contact_changed', 0)),
+                    metadata.get('profiles_changed', 0),
+                    metadata.get('switches_changed', 0)
+                )
+            elif event_type in ('welcome', 'connection_ready'):
+                # 处理WebSocket连接欢迎消息
+                welcome_msg = metadata.get(
+                    'message',
+                    data.get('Message', data.get('message', 'WebSocket连接已建立'))
+                )
+                logger.info(f"[wxpad] 收到WebSocket欢迎消息: {welcome_msg}")
+
+                # 如果welcome消息包含额外的连接信息，可以在这里处理
+                if 'data' in data and isinstance(data['data'], dict):
+                    logger.debug(f"[wxpad] Welcome消息包含额外信息: {data['data']}")
+                    # 可以从welcome消息中提取服务器时间、连接ID等信息
+                    server_time = data['data'].get('serverTime')
+                    connection_id = data['data'].get('connectionId')
+                    if server_time:
+                        logger.debug(f"[wxpad] 服务器时间: {server_time}")
+                    if connection_id:
+                        logger.debug(f"[wxpad] 连接ID: {connection_id}")
+
+                # welcome消息通常是连接建立后的确认消息，表示连接正常工作
+                logger.info("[wxpad] WebSocket连接已确认，可以正常接收消息")
+
+                # 重置重连计数，表示连接正常
+                self.ws_reconnect_count = 0
+
+                pass
+            elif event_type == 'heartbeat':
+                # 处理WebSocket心跳消息
+                timestamp = data.get('timestamp')
+                current_time = int(time.time())
+
+                if timestamp:
+                    logger.debug(f"[wxpad] 收到心跳消息: timestamp={timestamp}")
+                else:
+                    logger.debug(f"[wxpad] 收到心跳消息: {data}")
+
+                # 更新最后收到心跳的时间戳
+                self.last_heartbeat_time = current_time
+                logger.debug(f"[wxpad] 心跳时间已更新: {self.last_heartbeat_time}")
+
+                # 心跳消息表示连接仍然活跃，连接状态良好
+                pass
             else:
                 logger.warning(f"[wxpad] 收到未知格式的WebSocket消息: {data}")
 
@@ -557,16 +863,7 @@ class WxpadChannel(ChatChannel):
 
     def _convert_message(self, msg):
         """转换消息格式"""
-        return {
-            'FromUserName': self._extract_str(msg.get('from_user_name', {})),
-            'ToUserName': self._extract_str(msg.get('to_user_name', {})),
-            'Content': msg.get('content', {}),  # 保留原始字典结构，让WxpadMessage处理
-            'MsgType': msg.get('msg_type', 1),
-            'CreateTime': msg.get('create_time', int(time.time())),
-            'MsgSource': msg.get('msg_source', ''),
-            'MsgId': msg.get('msg_id', 0),
-            'NewMsgId': msg.get('new_msg_id', 0)
-        }
+        return normalize_websocket_message(msg)
 
     def _should_ignore_message(self, xmsg):
         """统一的消息过滤检查"""
@@ -587,7 +884,7 @@ class WxpadChannel(ChatChannel):
             return True
 
         # 3. 自己发送的消息过滤
-        if hasattr(xmsg, 'from_user_id') and xmsg.from_user_id == self.wxid:
+        if getattr(xmsg, 'my_msg', False) or (hasattr(xmsg, 'from_user_id') and xmsg.from_user_id == self.wxid):
             logger.debug(f"[wxpad] ignore message from myself: {xmsg.from_user_id}")
             return True
 
@@ -600,6 +897,11 @@ class WxpadChannel(ChatChannel):
 
     def _handle_message(self, msg):
         xmsg = WxpadMessage(msg, self.client)
+
+        # MAX 的 quote app 只给被引用消息ID；先从本地最近消息缓存恢复原文。
+        self._restore_quoted_content(xmsg)
+        # 在过滤自己发出的回显之前也记录，允许用户引用机器人的上一条回复。
+        self._remember_message(xmsg)
 
         # 统一过滤检查
         if self._should_ignore_message(xmsg):
@@ -643,7 +945,23 @@ class WxpadChannel(ChatChannel):
             logger.debug(f"[wxpad] 检测到语音消息，开始下载处理")
             xmsg.prepare()  # 触发语音下载
 
+        # 不把一个并不存在的临时路径交给图片识别、语音识别或文件处理
+        # 线程；下载失败时保留一条可处理的文本占位消息。
+        media_labels = {
+            ContextType.IMAGE: "图片",
+            ContextType.VIDEO: "视频",
+            ContextType.FILE: "文件",
+            ContextType.VOICE: "语音",
+        }
+        if xmsg.ctype in media_labels and not os.path.isfile(str(xmsg.content or "")):
+            label = media_labels[xmsg.ctype]
+            logger.warning(f"[wxpad] {label}下载失败，已阻止不存在的临时文件进入处理队列")
+            xmsg.ctype = ContextType.TEXT
+            xmsg.content = f"[{label}消息，下载失败]"
+
         # 处理消息
+        if xmsg.is_group:
+            logger.info(f"[wxpad] 准备处理群消息: group_id={xmsg.from_user_id}, group_name={getattr(xmsg, 'other_user_nickname', 'NONE')}, actual_user={xmsg.actual_user_id}")
         context = self._compose_context(xmsg.ctype, xmsg.content, msg=xmsg, isgroup=xmsg.is_group)
         if context is not None:
             # 只有成功生成上下文后，才处理引用图片/文件的下载和缓存
@@ -778,7 +1096,25 @@ class WxpadChannel(ChatChannel):
                             logger.error(f"[wxpad] Voice splitting failed for {original_voice_file_path}. No segments created.")
                             logger.info(f"[wxpad] Attempting to send {original_voice_file_path} as fallback.")
                             # 直接发送原文件作为回退
-                            fallback_result = asyncio.run(self._send_voice(receiver, original_voice_file_path))
+                            # 使用兼容非主线程的方式运行异步代码
+                            try:
+                                # 在 Windows 上使用 SelectorEventLoop 避免 ProactorEventLoop 的信号问题
+                                if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
+                                    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
+                                    fallback_result = loop.run_until_complete(self._send_voice(receiver, original_voice_file_path))
+                                finally:
+                                    try:
+                                        loop.close()
+                                    except:
+                                        pass  # 忽略关闭时的错误
+                            except Exception as e:
+                                logger.error(f"[wxpad] Failed to run async voice send (fallback): {e}")
+                                fallback_result = None
+
                             if fallback_result and isinstance(fallback_result, dict) and fallback_result.get("Success", False):
                                 logger.info(f"[wxpad] Fallback: Sent voice file successfully: {original_voice_file_path}")
                             else:
@@ -789,14 +1125,32 @@ class WxpadChannel(ChatChannel):
 
                         for i, segment_path in enumerate(segment_paths):
                             # SILK转换和发送都在_send_voice方法中处理
-                            segment_result = asyncio.run(self._send_voice(receiver, segment_path))
+                            # 使用兼容非主线程的方式运行异步代码
+                            try:
+                                # 在 Windows 上使用 SelectorEventLoop 避免 ProactorEventLoop 的信号问题
+                                if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
+                                    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                try:
+                                    segment_result = loop.run_until_complete(self._send_voice(receiver, segment_path))
+                                finally:
+                                    try:
+                                        loop.close()
+                                    except:
+                                        pass  # 忽略关闭时的错误
+                            except Exception as e:
+                                logger.error(f"[wxpad] Failed to run async voice send: {e}")
+                                segment_result = None
+
                             if segment_result and isinstance(segment_result, dict) and segment_result.get("Success", False):
                                 logger.info(f"[wxpad] Sent voice segment {i+1}/{len(segment_paths)} successfully: {segment_path}")
                             else:
                                 logger.warning(f"[wxpad] Sending voice segment {i+1}/{len(segment_paths)} failed: {segment_path}, Result: {segment_result}")
-                                # 如果片段失败，继续发送其他片段
+                                # 如果片段失败,继续发送其他片段
 
-                            # 片段间添加间隔，避免发送过快
+                            # 片段间添加间隔,避免发送过快
                             if i < len(segment_paths) - 1:
                                 time.sleep(0.8)
 
@@ -985,6 +1339,9 @@ class WxpadChannel(ChatChannel):
 
                         if upload_result.get("Code") == 200:
                             logger.info(f"[wxpad] 视频URL上传成功")
+                            if self.client._is_wechat08():
+                                logger.info(f"[wxpad] 视频URL发送成功 {receiver}")
+                                return
                             upload_data = upload_result.get("Data", {})
 
                             # 第二步：转发视频消息
@@ -1093,18 +1450,18 @@ class WxpadChannel(ChatChannel):
                 else:
                     logger.error(f"[wxpad] Invalid video content format: {type(reply.content)}")
                     return
-                
+
                 # 处理视频数据 - 统一处理所有格式
                 if video_data is not None:
                     # 初始化变量避免作用域问题
                     video_base64 = None
                     thumb_base64 = None
-                    
+
                     # 确保所需模块可用
                     import base64 as b64_module
                     import os
                     import uuid
-                    
+
                     try:
                         # 处理不同类型的视频数据
                         if isinstance(video_data, str):
@@ -1285,21 +1642,32 @@ class WxpadChannel(ChatChannel):
 
                         # 使用CDN上传视频（参考示例脚本的成功实现）
                         logger.info(f"[wxpad] 开始上传视频到CDN...")
-                        
+
                         # 确保变量已定义
                         if video_base64 is None or thumb_base64 is None:
                             logger.error(f"[wxpad] 视频或缩略图数据未正确初始化")
                             raise Exception("视频或缩略图数据未正确初始化")
 
-                        # 直接使用base64格式上传（与示例脚本保持一致）
-                        upload_result = self.client.cdn_upload_video(
-                            thumb_data=thumb_base64,
-                            to_user_name=receiver,
-                            video_data=video_base64  # 修正：直接使用base64字符串格式
-                        )
+                        # MAX 使用单步 SendVideo；旧 PadPro 保留“上传后转发”的两步流程。
+                        if self.client._is_wechat08():
+                            upload_result = self.client.send_video(
+                                video_data=video_base64,
+                                image_data=thumb_base64,
+                                play_length=play_length,
+                                to_user_name=receiver,
+                            )
+                        else:
+                            upload_result = self.client.cdn_upload_video(
+                                thumb_data=thumb_base64,
+                                to_user_name=receiver,
+                                video_data=video_base64
+                            )
 
                         if upload_result.get("Code") == 200:
                             logger.info(f"[wxpad] 视频上传成功")
+                            if self.client._is_wechat08():
+                                logger.info(f"[wxpad] 视频发送成功 {receiver}")
+                                return
                             upload_data = upload_result.get("Data", {})
 
                             # 第二步：转发视频消息
@@ -1754,7 +2122,3 @@ class WxpadChannel(ChatChannel):
             logger.error(f"[wxpad] Exception in _send_voice for {voice_file_path_segment} to {to_user_id}: {e}")
             logger.error(traceback.format_exc())
             return {"Success": False, "Message": f"General exception in _send_voice: {e}"}
-
-
-
-
